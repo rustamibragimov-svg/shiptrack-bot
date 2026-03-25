@@ -1,7 +1,7 @@
 """
 ShipTrack Telegram Bot
-Отгрузки: АЛИ 24.03 / МКО
-Возвраты: сообщение со словом "возвратов" + файл
+Топик "Приёмка"  → отгрузки (АЛИ / МКО)
+Топик "Отгрузка" → возвраты
 """
 import os, re, csv, logging, tempfile, threading
 from datetime import datetime
@@ -14,12 +14,17 @@ from telegram.ext import (
     filters, ContextTypes
 )
 
-# ══════════════════════════════════════════════
-# ЗНАЧЕНИЯ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ KOYEB
+# ══════════════════════════════════════════════════════════════
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ — задаются в Koyeb → Environment
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-# ══════════════════════════════════════════════
+
+# ID топиков — узнайте через /topicid в каждом топике
+# После получения ID добавьте их в Koyeb → Environment
+TOPIC_PRIEMKA  = int(os.environ.get("TOPIC_PRIEMKA", "0"))   # топик "Приёмка"  → отгрузки
+TOPIC_OTGRUZKA = int(os.environ.get("TOPIC_OTGRUZKA", "0"))  # топик "Отгрузка" → возвраты
+# ══════════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +39,7 @@ RETURN_WINDOW  = 5 * 60  # 5 минут
 RETURN_WORDS   = {"возврат", "возвратов", "возврата", "возвраты"}
 
 
-# ── Health check сервер для Koyeb ────────────────────────────────────────────
+# ── Health check сервер для Koyeb ─────────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -43,7 +48,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        pass  # отключаем лишние логи
+        pass
 
 
 def run_health_server():
@@ -53,7 +58,7 @@ def run_health_server():
     server.serve_forever()
 
 
-# ── Логика определения возврата ──────────────────────────────────────────────
+# ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def has_return_word(text):
     if not text:
@@ -86,17 +91,18 @@ def parse_date(text):
 
 
 def detect(caption, chat_id):
+    """Определяет тип файла по подписи и истории сообщений."""
     today = datetime.now()
     up = (caption or "").strip().upper()
 
-    # Явная подпись ВОЗВРАТ к файлу
+    # Явная подпись ВОЗВРАТ
     if any(k in up for k in ("ВОЗВРАТ", "VOZVRAT", "RETURN")):
         di, dl = parse_date(up)
         return "return", "ali", di, dl
 
     # Недавнее сообщение про возврат в чате
     if recent_return_signal(chat_id):
-        log.info("🔄 Файл = возврат (по недавнему сообщению в чате)")
+        log.info("🔄 Файл = возврат (по недавнему сообщению)")
         return "return", "ali", today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
     # АЛИ + дата
@@ -111,7 +117,7 @@ def detect(caption, chat_id):
     return "unknown", None, today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
 
-# ── Парсеры файлов ───────────────────────────────────────────────────────────
+# ── Парсеры файлов ────────────────────────────────────────────────────────────
 
 def parse_shipment_excel(path):
     wb = openpyxl.load_workbook(path, data_only=True)
@@ -250,17 +256,21 @@ def parse_return_excel(path):
     return items, act_number
 
 
-# ── Сохранение в Supabase ────────────────────────────────────────────────────
+# ── Сохранение в Supabase ─────────────────────────────────────────────────────
 
 def save_shipment(parcels, filename, sender, project, date, date_label):
-    prefix = {"ali": "ALI", "mko": "MKO"}.get(project, "SHP")
+    prefix = {"ali": "ALI", "mko": "UCB"}.get(project, "SHP")
     names  = {
         "ali": f"AliExpress от {date_label}",
         "mko": f"Uzum Crossborder от {date_label}",
     }
     name = names.get(project, f"Партия от {date_label}")
-    n    = len(db.table("shipments").select("id").like("id", f"{prefix}-%").execute().data) + 1
-    sid  = f"{prefix}-{n:03d}"
+
+    # ID формата "ALI 25.03", при дублях "ALI 25.03-2", "ALI 25.03-3"
+    base_id  = f"{prefix} {date_label}"
+    existing = db.table("shipments").select("id").like("id", f"{base_id}%").execute().data
+    sid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
+
     db.table("shipments").insert({
         "id":            sid,
         "name":          name,
@@ -284,8 +294,12 @@ def save_return(items, act_number, filename, sender, date, date_label):
     act_label = f" (Акт №{act_number})" if act_number else ""
     name      = f"Возврат от {date_label}{act_label}"
     total     = sum(i["cost"] for i in items)
-    n         = len(db.table("returns").select("id").execute().data) + 1
-    rid       = f"RET-{n:03d}"
+
+    # ID формата "RET 25.03", при дублях "RET 25.03-2"
+    base_id  = f"RET {date_label}"
+    existing = db.table("returns").select("id").like("id", f"{base_id}%").execute().data
+    rid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
+
     db.table("returns").insert({
         "id":           rid,
         "name":         name,
@@ -306,10 +320,10 @@ def save_return(items, act_number, filename, sender, date, date_label):
     return rid, name, total
 
 
-# ── Обработчики Telegram ─────────────────────────────────────────────────────
+# ── Обработчики Telegram ──────────────────────────────────────────────────────
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Слушает сообщения — ищет слова о возврате."""
+    """Слушает сообщения — запоминает сигналы о возврате."""
     text    = update.message.text or ""
     chat_id = update.message.chat_id
     if has_return_word(text):
@@ -319,20 +333,44 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает файлы из группы."""
-    doc     = update.message.document
-    fname   = doc.file_name or ""
-    caption = update.message.caption or ""
-    chat_id = update.message.chat_id
+    doc       = update.message.document
+    fname     = doc.file_name or ""
+    caption   = update.message.caption or ""
+    chat_id   = update.message.chat_id
+    thread_id = update.message.message_thread_id or 0
 
     if not fname.lower().endswith((".xlsx", ".xls", ".csv")):
         return
 
     sender = update.message.from_user.full_name or "Unknown"
-    ftype, project, date, date_label = detect(caption, chat_id)
 
-    # Сбрасываем сигнал возврата после обработки файла
-    if ftype == "return" and chat_id in return_signals:
-        del return_signals[chat_id]
+    # ── Определяем тип по топику (если настроены) ──
+    if TOPIC_PRIEMKA and TOPIC_OTGRUZKA:
+        if thread_id == TOPIC_PRIEMKA:
+            # Топик "Приёмка" → всегда отгрузка
+            ftype, project, date, date_label = detect(caption, chat_id)
+            if ftype == "unknown":
+                await update.message.reply_text(
+                    "❓ Добавьте подпись к файлу:\n"
+                    "• `АЛИ 25.03` — AliExpress\n"
+                    "• `МКО` — Uzum Crossborder",
+                    parse_mode="Markdown"
+                )
+                return
+        elif thread_id == TOPIC_OTGRUZKA:
+            # Топик "Отгрузка" → всегда возврат
+            _, _, date, date_label = detect(caption, chat_id)
+            ftype, project = "return", "ali"
+            if chat_id in return_signals:
+                del return_signals[chat_id]
+        else:
+            # Другой топик — игнорируем
+            return
+    else:
+        # Топики не настроены → определяем по подписи и сигналам
+        ftype, project, date, date_label = detect(caption, chat_id)
+        if ftype == "return" and chat_id in return_signals:
+            del return_signals[chat_id]
 
     labels = {"shipment": "Отгрузка", "return": "Возврат", "unknown": "Файл"}
     msg = await update.message.reply_text(
@@ -359,8 +397,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📋 {name}\n"
                 f"📦 Заказов: *{len(items)}*\n"
                 f"💰 Сумма: *{total:,.0f} ₽*\n"
-                f"🆔 ID: `{rid}`\n\n"
-                f"🌐 Обновлено в веб-приложении",
+                f"🆔 ID: `{rid}`",
                 parse_mode="Markdown"
             )
 
@@ -387,8 +424,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{proj_name}\n"
                 f"📋 {name}\n"
                 f"📦 Посылок: *{len(parcels)}*\n"
-                f"🆔 ID: `{sid}`\n\n"
-                f"🌐 Обновлено в веб-приложении",
+                f"🆔 ID: `{sid}`",
                 parse_mode="Markdown"
             )
 
@@ -405,10 +441,27 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except Exception as e:
-        log.exception("Ошибка обработки файла: %s", e)
+        log.exception("Ошибка: %s", e)
         await msg.edit_text(f"❌ Ошибка при обработке файла:\n{str(e)[:200]}")
     finally:
         os.unlink(path)
+
+
+async def on_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает ID текущего топика — нужно для настройки переменных в Koyeb."""
+    thread_id = update.message.message_thread_id or 0
+    chat_id   = update.message.chat_id
+    await update.message.reply_text(
+        f"📌 *Информация о топике*\n\n"
+        f"Chat ID: `{chat_id}`\n"
+        f"Topic ID: `{thread_id}`\n\n"
+        f"Добавьте в Koyeb → Environment variables:\n\n"
+        f"Если это топик *Приёмка* (отгрузки):\n"
+        f"`TOPIC_PRIEMKA` = `{thread_id}`\n\n"
+        f"Если это топик *Отгрузка* (возвраты):\n"
+        f"`TOPIC_OTGRUZKA` = `{thread_id}`",
+        parse_mode="Markdown"
+    )
 
 
 async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,32 +501,34 @@ async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *ShipTrack — Инструкция*\n\n"
-        "Отправьте файл с подписью:\n\n"
-        "🛒 *AliExpress:* `АЛИ 25.03`\n"
-        "📦 *Uzum MKO:* `МКО`\n"
-        "🔄 *Возврат:* напишите «возвратов» в сообщении "
-        "и следом отправьте файл\n\n"
+        "В топике *Приёмка* отправьте файл с подписью:\n"
+        "🛒 `АЛИ 25.03` — отгрузка AliExpress\n"
+        "📦 `МКО` — отгрузка Uzum Crossborder\n\n"
+        "В топике *Отгрузка* отправьте файл возврата — "
+        "бот определит его автоматически.\n\n"
         "Форматы: .xlsx, .xls, .csv\n\n"
         "/status — статистика\n"
+        "/topicid — ID текущего топика\n"
         "/help — эта справка",
         parse_mode="Markdown"
     )
 
 
-# ── Запуск ───────────────────────────────────────────────────────────────────
+# ── Запуск ────────────────────────────────────────────────────────────────────
 
 def main():
-    # Запускаем health check сервер в фоновом потоке (нужен для Koyeb)
+    # Health check сервер для Koyeb (в фоновом потоке)
     t = threading.Thread(target=run_health_server, daemon=True)
     t.start()
 
-    # Запускаем Telegram бота
+    # Telegram бот
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(CommandHandler("status", on_status))
-    app.add_handler(CommandHandler("help",   on_help))
-    app.add_handler(CommandHandler("start",  on_help))
+    app.add_handler(CommandHandler("status",  on_status))
+    app.add_handler(CommandHandler("topicid", on_topicid))
+    app.add_handler(CommandHandler("help",    on_help))
+    app.add_handler(CommandHandler("start",   on_help))
     log.info("🤖 ShipTrack Bot запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
