@@ -326,7 +326,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает файлы из группы."""
+    """Обрабатывает файлы из группы или лички."""
     doc       = update.message.document
     fname     = doc.file_name or ""
     caption   = update.message.caption or ""
@@ -341,6 +341,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Определяем тип по топику (если настроены) ──
     if TOPIC_PRIEMKA and TOPIC_OTGRUZKA:
         if thread_id == TOPIC_PRIEMKA:
+            # Топик "Приёмка" → всегда отгрузка
             ftype, project, date, date_label = detect(caption, chat_id)
             if ftype == "unknown":
                 await update.message.reply_text(
@@ -351,12 +352,16 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         elif thread_id == TOPIC_OTGRUZKA:
+            # Топик "Отгрузка" → всегда возврат
             _, _, date, date_label = detect(caption, chat_id)
             ftype, project = "return", "ali"
             if chat_id in return_signals:
                 del return_signals[chat_id]
         else:
-            return
+            # Личка или другой топик → определяем по подписи
+            ftype, project, date, date_label = detect(caption, chat_id)
+            if ftype == "return" and chat_id in return_signals:
+                del return_signals[chat_id]
     else:
         # Топики не настроены → определяем по подписи и сигналам
         ftype, project, date, date_label = detect(caption, chat_id)
