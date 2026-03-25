@@ -263,7 +263,7 @@ def save_shipment(parcels, filename, sender, project, date, date_label):
     name = names.get(project, f"Партия от {date_label}")
 
     base_id  = f"{prefix} {date_label}"
-    existing = db.table("shipments").select("id").like("id", f"{base_id}%").execute().data
+    existing = db.table("shipments").select("id").eq("project", project).eq("date", date).execute().data
     sid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
 
     db.table("shipments").insert({
@@ -291,7 +291,7 @@ def save_return(items, act_number, filename, sender, date, date_label):
     total     = sum(i["cost"] for i in items)
 
     base_id  = f"RET {date_label}"
-    existing = db.table("returns").select("id").like("id", f"{base_id}%").execute().data
+    existing = db.table("returns").select("id").eq("date", date).execute().data
     rid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
 
     db.table("returns").insert({
