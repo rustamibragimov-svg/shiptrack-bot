@@ -21,7 +21,6 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # ID топиков — узнайте через /topicid в каждом топике
-# После получения ID добавьте их в Koyeb → Environment
 TOPIC_PRIEMKA  = int(os.environ.get("TOPIC_PRIEMKA", "0"))   # топик "Приёмка"  → отгрузки
 TOPIC_OTGRUZKA = int(os.environ.get("TOPIC_OTGRUZKA", "0"))  # топик "Отгрузка" → возвраты
 # ══════════════════════════════════════════════════════════════
@@ -31,15 +30,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 log = logging.getLogger(__name__)
-db = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Память о сигналах возврата: {chat_id: datetime}
-return_signals = {}
-RETURN_WINDOW  = 5 * 60  # 5 минут
-RETURN_WORDS   = {"возврат", "возвратов", "возврата", "возвраты"}
 
 
 # ── Health check сервер для Koyeb ─────────────────────────────────────────────
+# Запускаем НЕМЕДЛЕННО — до всего остального, чтобы Koyeb не убил контейнер
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -51,11 +45,19 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 8000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    log.info("✅ Health server запущен на порту %s", port)
-    server.serve_forever()
+_health_port   = int(os.environ.get("PORT", 8000))
+_health_server = HTTPServer(("0.0.0.0", _health_port), HealthHandler)
+threading.Thread(target=_health_server.serve_forever, daemon=True).start()
+log.info("✅ Health server запущен на порту %s", _health_port)
+
+# ── Инициализация Supabase ────────────────────────────────────────────────────
+
+db = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Память о сигналах возврата: {chat_id: datetime}
+return_signals = {}
+RETURN_WINDOW  = 5 * 60  # 5 минут
+RETURN_WORDS   = {"возврат", "возвратов", "возврата", "возвраты"}
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -95,22 +97,18 @@ def detect(caption, chat_id):
     today = datetime.now()
     up = (caption or "").strip().upper()
 
-    # Явная подпись ВОЗВРАТ
     if any(k in up for k in ("ВОЗВРАТ", "VOZVRAT", "RETURN")):
         di, dl = parse_date(up)
         return "return", "ali", di, dl
 
-    # Недавнее сообщение про возврат в чате
     if recent_return_signal(chat_id):
         log.info("🔄 Файл = возврат (по недавнему сообщению)")
         return "return", "ali", today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
-    # АЛИ + дата
     if "АЛИ" in up or "ALI" in up:
         di, dl = parse_date(up)
         return "shipment", "ali", di, dl
 
-    # МКО
     if "МКО" in up or "MKO" in up:
         return "shipment", "mko", today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
@@ -207,7 +205,6 @@ def parse_return_excel(path):
     items = []
     act_number = ""
 
-    # Ищем номер акта в заголовке
     for row in rows[:5]:
         for cell in row:
             if cell and "акт" in str(cell).lower():
@@ -215,7 +212,6 @@ def parse_return_excel(path):
                 if m:
                     act_number = m.group(1)
 
-    # Ищем строку с заголовками таблицы
     header_idx = None
     for i, row in enumerate(rows):
         s = " ".join(str(c or "").lower() for c in row)
@@ -266,7 +262,6 @@ def save_shipment(parcels, filename, sender, project, date, date_label):
     }
     name = names.get(project, f"Партия от {date_label}")
 
-    # ID формата "ALI 25.03", при дублях "ALI 25.03-2", "ALI 25.03-3"
     base_id  = f"{prefix} {date_label}"
     existing = db.table("shipments").select("id").like("id", f"{base_id}%").execute().data
     sid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
@@ -295,7 +290,6 @@ def save_return(items, act_number, filename, sender, date, date_label):
     name      = f"Возврат от {date_label}{act_label}"
     total     = sum(i["cost"] for i in items)
 
-    # ID формата "RET 25.03", при дублях "RET 25.03-2"
     base_id  = f"RET {date_label}"
     existing = db.table("returns").select("id").like("id", f"{base_id}%").execute().data
     rid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
@@ -347,7 +341,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Определяем тип по топику (если настроены) ──
     if TOPIC_PRIEMKA and TOPIC_OTGRUZKA:
         if thread_id == TOPIC_PRIEMKA:
-            # Топик "Приёмка" → всегда отгрузка
             ftype, project, date, date_label = detect(caption, chat_id)
             if ftype == "unknown":
                 await update.message.reply_text(
@@ -358,13 +351,11 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         elif thread_id == TOPIC_OTGRUZKA:
-            # Топик "Отгрузка" → всегда возврат
             _, _, date, date_label = detect(caption, chat_id)
             ftype, project = "return", "ali"
             if chat_id in return_signals:
                 del return_signals[chat_id]
         else:
-            # Другой топик — игнорируем
             return
     else:
         # Топики не настроены → определяем по подписи и сигналам
@@ -517,11 +508,6 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
 def main():
-    # Health check сервер для Koyeb (в фоновом потоке)
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
-
-    # Telegram бот
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
