@@ -3,8 +3,9 @@ ShipTrack Telegram Bot
 Отгрузки: АЛИ 24.03 / МКО
 Возвраты: сообщение со словом "возвратов" + файл
 """
-import os, re, csv, logging, tempfile
+import os, re, csv, logging, tempfile, threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import openpyxl
 from supabase import create_client
 from telegram import Update
@@ -14,8 +15,7 @@ from telegram.ext import (
 )
 
 # ══════════════════════════════════════════════
-# ЗНАЧЕНИЯ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
-# (вы зададите их в Koyeb — не нужно вписывать сюда)
+# ЗНАЧЕНИЯ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ KOYEB
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -33,6 +33,27 @@ return_signals = {}
 RETURN_WINDOW  = 5 * 60  # 5 минут
 RETURN_WORDS   = {"возврат", "возвратов", "возврата", "возвраты"}
 
+
+# ── Health check сервер для Koyeb ────────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # отключаем лишние логи
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info("✅ Health server запущен на порту %s", port)
+    server.serve_forever()
+
+
+# ── Логика определения возврата ──────────────────────────────────────────────
 
 def has_return_word(text):
     if not text:
@@ -68,23 +89,29 @@ def detect(caption, chat_id):
     today = datetime.now()
     up = (caption or "").strip().upper()
 
+    # Явная подпись ВОЗВРАТ к файлу
     if any(k in up for k in ("ВОЗВРАТ", "VOZVRAT", "RETURN")):
         di, dl = parse_date(up)
         return "return", "ali", di, dl
 
+    # Недавнее сообщение про возврат в чате
     if recent_return_signal(chat_id):
-        log.info("🔄 Файл = возврат (по недавнему сообщению)")
+        log.info("🔄 Файл = возврат (по недавнему сообщению в чате)")
         return "return", "ali", today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
+    # АЛИ + дата
     if "АЛИ" in up or "ALI" in up:
         di, dl = parse_date(up)
         return "shipment", "ali", di, dl
 
+    # МКО
     if "МКО" in up or "MKO" in up:
         return "shipment", "mko", today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
     return "unknown", None, today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
+
+# ── Парсеры файлов ───────────────────────────────────────────────────────────
 
 def parse_shipment_excel(path):
     wb = openpyxl.load_workbook(path, data_only=True)
@@ -94,7 +121,7 @@ def parse_shipment_excel(path):
         if not rows:
             continue
         header = [str(c or "").lower() for c in rows[0]]
-        bi = next((i for i, h in enumerate(header) if "штрихкод" in h or "barcode" in h), len(header)-1)
+        bi = next((i for i, h in enumerate(header) if "штрихкод" in h or "barcode" in h), len(header) - 1)
         ni = next((i for i, h in enumerate(header) if "имя" in h or "name" in h or "фио" in h), -1)
         pi = next((i for i, h in enumerate(header) if "телефон" in h or "phone" in h), -1)
         ai = next((i for i, h in enumerate(header) if "адрес" in h or "address" in h), -1)
@@ -108,14 +135,16 @@ def parse_shipment_excel(path):
             if barcode and len(barcode) >= 5:
                 w = 0
                 if wi >= 0:
-                    try: w = int(float(str(row[wi] or 0)))
-                    except: pass
+                    try:
+                        w = int(float(str(row[wi] or 0)))
+                    except Exception:
+                        pass
                 parcels.append({
-                    "barcode": barcode,
+                    "barcode":        barcode,
                     "recipient_name": g(row, ni),
-                    "phone": g(row, pi),
-                    "address": g(row, ai),
-                    "weight": w,
+                    "phone":          g(row, pi),
+                    "address":        g(row, ai),
+                    "weight":         w,
                 })
     return parcels
 
@@ -125,13 +154,15 @@ def parse_shipment_csv(path):
     for enc in ["utf-8-sig", "utf-8", "cp1251"]:
         try:
             with open(path, "r", encoding=enc) as f:
-                s = f.read(2048); f.seek(0)
+                s = f.read(2048)
+                f.seek(0)
                 delim = ";" if s.count(";") > s.count(",") else ","
                 for row in csv.DictReader(f, delimiter=delim):
                     barcode = name = phone = address = ""
                     weight = 0
                     for k, v in row.items():
-                        if not k: continue
+                        if not k:
+                            continue
                         kl = k.lower()
                         if "штрихкод" in kl or "barcode" in kl:
                             barcode = str(v or "").strip()
@@ -142,17 +173,19 @@ def parse_shipment_csv(path):
                         elif "адрес" in kl or "address" in kl:
                             address = str(v or "").strip()
                         elif "вес" in kl or "weight" in kl:
-                            try: weight = int(float(str(v or 0)))
-                            except: pass
+                            try:
+                                weight = int(float(str(v or 0)))
+                            except Exception:
+                                pass
                     if not barcode and row:
                         barcode = str(list(row.values())[-1] or "").strip()
                     if barcode and len(barcode) >= 5:
                         parcels.append({
-                            "barcode": barcode,
+                            "barcode":        barcode,
                             "recipient_name": name,
-                            "phone": phone,
-                            "address": address,
-                            "weight": weight,
+                            "phone":          phone,
+                            "address":        address,
+                            "weight":         weight,
                         })
             if parcels:
                 return parcels
@@ -168,6 +201,7 @@ def parse_return_excel(path):
     items = []
     act_number = ""
 
+    # Ищем номер акта в заголовке
     for row in rows[:5]:
         for cell in row:
             if cell and "акт" in str(cell).lower():
@@ -175,6 +209,7 @@ def parse_return_excel(path):
                 if m:
                     act_number = m.group(1)
 
+    # Ищем строку с заголовками таблицы
     header_idx = None
     for i, row in enumerate(rows):
         s = " ".join(str(c or "").lower() for c in row)
@@ -202,14 +237,20 @@ def parse_return_excel(path):
             continue
         qty = 1
         cost = 0.0
-        try: qty = int(row[qi] or 1)
-        except: pass
-        try: cost = float(row[ci] or 0)
-        except: pass
+        try:
+            qty = int(row[qi] or 1)
+        except Exception:
+            pass
+        try:
+            cost = float(row[ci] or 0)
+        except Exception:
+            pass
         items.append({"order_number": order, "quantity": qty, "cost": cost})
 
     return items, act_number
 
+
+# ── Сохранение в Supabase ────────────────────────────────────────────────────
 
 def save_shipment(parcels, filename, sender, project, date, date_label):
     prefix = {"ali": "ALI", "mko": "MKO"}.get(project, "SHP")
@@ -218,40 +259,57 @@ def save_shipment(parcels, filename, sender, project, date, date_label):
         "mko": f"Uzum Crossborder от {date_label}",
     }
     name = names.get(project, f"Партия от {date_label}")
-    n = len(db.table("shipments").select("id").like("id", f"{prefix}-%").execute().data) + 1
-    sid = f"{prefix}-{n:03d}"
+    n    = len(db.table("shipments").select("id").like("id", f"{prefix}-%").execute().data) + 1
+    sid  = f"{prefix}-{n:03d}"
     db.table("shipments").insert({
-        "id": sid, "name": name, "project": project, "date": date,
-        "parcels_count": len(parcels), "status": "new",
-        "confirmed_at": "", "note": "", "filename": filename, "sender": sender,
+        "id":            sid,
+        "name":          name,
+        "project":       project,
+        "date":          date,
+        "parcels_count": len(parcels),
+        "status":        "new",
+        "confirmed_at":  "",
+        "note":          "",
+        "filename":      filename,
+        "sender":        sender,
     }).execute()
     for i in range(0, len(parcels), 50):
         db.table("parcels").insert(
-            [{"shipment_id": sid, **p} for p in parcels[i:i+50]]
+            [{"shipment_id": sid, **p} for p in parcels[i:i + 50]]
         ).execute()
     return sid, name
 
 
 def save_return(items, act_number, filename, sender, date, date_label):
     act_label = f" (Акт №{act_number})" if act_number else ""
-    name  = f"Возврат от {date_label}{act_label}"
-    total = sum(i["cost"] for i in items)
-    n     = len(db.table("returns").select("id").execute().data) + 1
-    rid   = f"RET-{n:03d}"
+    name      = f"Возврат от {date_label}{act_label}"
+    total     = sum(i["cost"] for i in items)
+    n         = len(db.table("returns").select("id").execute().data) + 1
+    rid       = f"RET-{n:03d}"
     db.table("returns").insert({
-        "id": rid, "name": name, "date": date,
-        "orders_count": len(items), "total_cost": total,
-        "status": "new", "confirmed_at": "", "note": "",
-        "filename": filename, "act_number": act_number, "sender": sender,
+        "id":           rid,
+        "name":         name,
+        "date":         date,
+        "orders_count": len(items),
+        "total_cost":   total,
+        "status":       "new",
+        "confirmed_at": "",
+        "note":         "",
+        "filename":     filename,
+        "act_number":   act_number,
+        "sender":       sender,
     }).execute()
     for i in range(0, len(items), 50):
         db.table("return_items").insert(
-            [{"return_id": rid, **item} for item in items[i:i+50]]
+            [{"return_id": rid, **item} for item in items[i:i + 50]]
         ).execute()
     return rid, name, total
 
 
+# ── Обработчики Telegram ─────────────────────────────────────────────────────
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Слушает сообщения — ищет слова о возврате."""
     text    = update.message.text or ""
     chat_id = update.message.chat_id
     if has_return_word(text):
@@ -260,6 +318,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает файлы из группы."""
     doc     = update.message.document
     fname   = doc.file_name or ""
     caption = update.message.caption or ""
@@ -271,6 +330,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = update.message.from_user.full_name or "Unknown"
     ftype, project, date, date_label = detect(caption, chat_id)
 
+    # Сбрасываем сигнал возврата после обработки файла
     if ftype == "return" and chat_id in return_signals:
         del return_signals[chat_id]
 
@@ -287,6 +347,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await (await doc.get_file()).download_to_drive(path)
 
+        # ── Возврат ──
         if ftype == "return":
             items, act_num = parse_return_excel(path)
             if not items:
@@ -303,9 +364,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
+        # ── Отгрузка ──
         elif ftype == "shipment":
-            parcels = (parse_shipment_csv(path) if ext == ".csv"
-                       else parse_shipment_excel(path))
+            parcels = (
+                parse_shipment_csv(path)
+                if ext == ".csv"
+                else parse_shipment_excel(path)
+            )
             if not parcels:
                 await msg.edit_text(
                     "⚠️ Не нашёл штрихкодов. Нужна колонка *Штрихкод*.",
@@ -314,7 +379,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             proj_name = {
                 "ali": "AliExpress 🛒",
-                "mko": "Uzum Crossborder 📦"
+                "mko": "Uzum Crossborder 📦",
             }.get(project, "")
             sid, name = save_shipment(parcels, fname, sender, project, date, date_label)
             await msg.edit_text(
@@ -327,10 +392,11 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
+        # ── Неизвестный тип ──
         else:
             await msg.edit_text(
                 "❓ Не могу определить тип файла.\n\n"
-                "Добавьте подпись:\n"
+                "Добавьте подпись к файлу:\n"
                 "• `АЛИ 25.03` — отгрузка AliExpress\n"
                 "• `МКО` — отгрузка Uzum\n"
                 "• `ВОЗВРАТ 17.03` — возврат\n\n"
@@ -339,8 +405,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except Exception as e:
-        log.exception("Ошибка: %s", e)
-        await msg.edit_text(f"❌ Ошибка:\n{str(e)[:200]}")
+        log.exception("Ошибка обработки файла: %s", e)
+        await msg.edit_text(f"❌ Ошибка при обработке файла:\n{str(e)[:200]}")
     finally:
         os.unlink(path)
 
@@ -394,7 +460,14 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Запуск ───────────────────────────────────────────────────────────────────
+
 def main():
+    # Запускаем health check сервер в фоновом потоке (нужен для Koyeb)
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
+    # Запускаем Telegram бота
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
