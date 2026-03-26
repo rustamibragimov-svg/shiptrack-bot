@@ -52,6 +52,26 @@ _health_server = HTTPServer(("0.0.0.0", _health_port), HealthHandler)
 threading.Thread(target=_health_server.serve_forever, daemon=True).start()
 log.info("✅ Health server запущен на порту %s", _health_port)
 
+
+# ── Самопинг — не даёт Koyeb усыпить сервис ──────────────────────────────────
+
+def self_ping():
+    import urllib.request
+    public_url = os.environ.get("PUBLIC_URL", "")
+    if not public_url:
+        log.warning("⚠️ PUBLIC_URL не задан — самопинг отключён")
+        return
+    while True:
+        time.sleep(4 * 60)  # каждые 4 минуты
+        try:
+            urllib.request.urlopen(public_url, timeout=10)
+            log.info("🏓 Self-ping OK")
+        except Exception as e:
+            log.warning("🏓 Self-ping failed: %s", e)
+
+threading.Thread(target=self_ping, daemon=True).start()
+
+
 # ── Инициализация Supabase ────────────────────────────────────────────────────
 
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -338,10 +358,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sender = update.message.from_user.full_name or "Unknown"
 
-    # ── Определяем тип по топику (если настроены) ──
     if TOPIC_PRIEMKA and TOPIC_OTGRUZKA:
         if thread_id == TOPIC_PRIEMKA:
-            # Топик "Приёмка" → всегда отгрузка
             ftype, project, date, date_label = detect(caption, chat_id)
             if ftype == "unknown":
                 await update.message.reply_text(
@@ -352,14 +370,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         elif thread_id == TOPIC_OTGRUZKA:
-            # Топик "Отгрузка" → всегда возврат
             _, _, date, date_label = detect(caption, chat_id)
             ftype, project = "return", "ali"
             if chat_id in return_signals:
                 del return_signals[chat_id]
         else:
-            # Другой топик группы → полностью молчим
-            # Личка → работаем по подписи
+            # Другой топик группы → молчим / Личка → по подписи
             if is_group:
                 return
             ftype, project, date, date_label = detect(caption, chat_id)
@@ -525,7 +541,6 @@ async def run_bot():
             drop_pending_updates=True
         )
         log.info("🤖 ShipTrack Bot запущен")
-        # Держим бота живым
         while True:
             await asyncio.sleep(1)
 
