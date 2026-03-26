@@ -2,6 +2,8 @@
 ShipTrack Telegram Bot
 Топик "Приёмка"  → отгрузки (АЛИ / МКО)
 Топик "Отгрузка" → возвраты
+Другие топики    → молчит
+Личка            → работает по подписи
 """
 import os, re, csv, logging, tempfile, threading, time
 from datetime import datetime
@@ -262,7 +264,6 @@ def save_shipment(parcels, filename, sender, project, date, date_label):
     name = names.get(project, f"Партия от {date_label}")
 
     base_id  = f"{prefix} {date_label}"
-    # Считаем партии по проекту и дате (без .like — оно не работает с uuid)
     existing = db.table("shipments").select("id").eq("project", project).eq("date", date).execute().data
     sid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
 
@@ -273,7 +274,7 @@ def save_shipment(parcels, filename, sender, project, date, date_label):
         "date":          date,
         "parcels_count": len(parcels),
         "status":        "new",
-        "confirmed_at":  None,   # ← NULL вместо пустой строки
+        "confirmed_at":  None,
         "note":          "",
         "filename":      filename,
         "sender":        sender,
@@ -291,7 +292,6 @@ def save_return(items, act_number, filename, sender, date, date_label):
     total     = sum(i["cost"] for i in items)
 
     base_id  = f"RET {date_label}"
-    # Считаем возвраты по дате
     existing = db.table("returns").select("id").eq("date", date).execute().data
     rid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
 
@@ -302,7 +302,7 @@ def save_return(items, act_number, filename, sender, date, date_label):
         "orders_count": len(items),
         "total_cost":   total,
         "status":       "new",
-        "confirmed_at": None,    # ← NULL вместо пустой строки
+        "confirmed_at": None,
         "note":         "",
         "filename":     filename,
         "act_number":   act_number,
@@ -331,6 +331,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption   = update.message.caption or ""
     chat_id   = update.message.chat_id
     thread_id = update.message.message_thread_id or 0
+    is_group  = update.message.chat.type in ("group", "supergroup")
 
     if not fname.lower().endswith((".xlsx", ".xls", ".csv")):
         return
@@ -340,6 +341,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Определяем тип по топику (если настроены) ──
     if TOPIC_PRIEMKA and TOPIC_OTGRUZKA:
         if thread_id == TOPIC_PRIEMKA:
+            # Топик "Приёмка" → всегда отгрузка
             ftype, project, date, date_label = detect(caption, chat_id)
             if ftype == "unknown":
                 await update.message.reply_text(
@@ -350,12 +352,16 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         elif thread_id == TOPIC_OTGRUZKA:
+            # Топик "Отгрузка" → всегда возврат
             _, _, date, date_label = detect(caption, chat_id)
             ftype, project = "return", "ali"
             if chat_id in return_signals:
                 del return_signals[chat_id]
         else:
-            # Личка или другой топик → определяем по подписи
+            # Другой топик группы → полностью молчим
+            # Личка → работаем по подписи
+            if is_group:
+                return
             ftype, project, date, date_label = detect(caption, chat_id)
             if ftype == "return" and chat_id in return_signals:
                 del return_signals[chat_id]
@@ -517,7 +523,7 @@ def main():
             log.info("🤖 ShipTrack Bot запущен")
             app.run_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True  # игнорируем накопившиеся сообщения при рестарте
+                drop_pending_updates=True
             )
         except Exception as e:
             log.error("❌ Бот упал с ошибкой: %s", e)
