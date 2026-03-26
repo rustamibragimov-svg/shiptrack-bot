@@ -3,7 +3,7 @@ ShipTrack Telegram Bot
 Топик "Приёмка"  → отгрузки (АЛИ / МКО)
 Топик "Отгрузка" → возвраты
 """
-import os, re, csv, logging, tempfile, threading
+import os, re, csv, logging, tempfile, threading, time
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import openpyxl
@@ -21,8 +21,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # ID топиков — узнайте через /topicid в каждом топике
-TOPIC_PRIEMKA  = int(os.environ.get("TOPIC_PRIEMKA", "0"))   # топик "Приёмка"  → отгрузки
-TOPIC_OTGRUZKA = int(os.environ.get("TOPIC_OTGRUZKA", "0"))  # топик "Отгрузка" → возвраты
+TOPIC_PRIEMKA  = int(os.environ.get("TOPIC_PRIEMKA", "0"))
+TOPIC_OTGRUZKA = int(os.environ.get("TOPIC_OTGRUZKA", "0"))
 # ══════════════════════════════════════════════════════════════
 
 logging.basicConfig(
@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 
 
 # ── Health check сервер для Koyeb ─────────────────────────────────────────────
-# Запускаем НЕМЕДЛЕННО — до всего остального, чтобы Koyeb не убил контейнер
+# Запускаем НЕМЕДЛЕННО — до всего остального
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -93,7 +93,6 @@ def parse_date(text):
 
 
 def detect(caption, chat_id):
-    """Определяет тип файла по подписи и истории сообщений."""
     today = datetime.now()
     up = (caption or "").strip().upper()
 
@@ -263,6 +262,7 @@ def save_shipment(parcels, filename, sender, project, date, date_label):
     name = names.get(project, f"Партия от {date_label}")
 
     base_id  = f"{prefix} {date_label}"
+    # Считаем партии по проекту и дате (без .like — оно не работает с uuid)
     existing = db.table("shipments").select("id").eq("project", project).eq("date", date).execute().data
     sid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
 
@@ -273,7 +273,7 @@ def save_shipment(parcels, filename, sender, project, date, date_label):
         "date":          date,
         "parcels_count": len(parcels),
         "status":        "new",
-        "confirmed_at":  "",
+        "confirmed_at":  None,   # ← NULL вместо пустой строки
         "note":          "",
         "filename":      filename,
         "sender":        sender,
@@ -291,6 +291,7 @@ def save_return(items, act_number, filename, sender, date, date_label):
     total     = sum(i["cost"] for i in items)
 
     base_id  = f"RET {date_label}"
+    # Считаем возвраты по дате
     existing = db.table("returns").select("id").eq("date", date).execute().data
     rid      = base_id if len(existing) == 0 else f"{base_id}-{len(existing) + 1}"
 
@@ -301,7 +302,7 @@ def save_return(items, act_number, filename, sender, date, date_label):
         "orders_count": len(items),
         "total_cost":   total,
         "status":       "new",
-        "confirmed_at": "",
+        "confirmed_at": None,    # ← NULL вместо пустой строки
         "note":         "",
         "filename":     filename,
         "act_number":   act_number,
@@ -317,7 +318,6 @@ def save_return(items, act_number, filename, sender, date, date_label):
 # ── Обработчики Telegram ──────────────────────────────────────────────────────
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Слушает сообщения — запоминает сигналы о возврате."""
     text    = update.message.text or ""
     chat_id = update.message.chat_id
     if has_return_word(text):
@@ -326,7 +326,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает файлы из группы или лички."""
     doc       = update.message.document
     fname     = doc.file_name or ""
     caption   = update.message.caption or ""
@@ -341,7 +340,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Определяем тип по топику (если настроены) ──
     if TOPIC_PRIEMKA and TOPIC_OTGRUZKA:
         if thread_id == TOPIC_PRIEMKA:
-            # Топик "Приёмка" → всегда отгрузка
             ftype, project, date, date_label = detect(caption, chat_id)
             if ftype == "unknown":
                 await update.message.reply_text(
@@ -352,7 +350,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         elif thread_id == TOPIC_OTGRUZKA:
-            # Топик "Отгрузка" → всегда возврат
             _, _, date, date_label = detect(caption, chat_id)
             ftype, project = "return", "ali"
             if chat_id in return_signals:
@@ -363,7 +360,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ftype == "return" and chat_id in return_signals:
                 del return_signals[chat_id]
     else:
-        # Топики не настроены → определяем по подписи и сигналам
         ftype, project, date, date_label = detect(caption, chat_id)
         if ftype == "return" and chat_id in return_signals:
             del return_signals[chat_id]
@@ -381,7 +377,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await (await doc.get_file()).download_to_drive(path)
 
-        # ── Возврат ──
         if ftype == "return":
             items, act_num = parse_return_excel(path)
             if not items:
@@ -397,7 +392,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
-        # ── Отгрузка ──
         elif ftype == "shipment":
             parcels = (
                 parse_shipment_csv(path)
@@ -424,7 +418,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
-        # ── Неизвестный тип ──
         else:
             await msg.edit_text(
                 "❓ Не могу определить тип файла.\n\n"
@@ -444,7 +437,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает ID текущего топика — нужно для настройки переменных в Koyeb."""
     thread_id = update.message.message_thread_id or 0
     chat_id   = update.message.chat_id
     await update.message.reply_text(
@@ -510,18 +502,27 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Запуск ────────────────────────────────────────────────────────────────────
+# ── Запуск с автоперезапуском при ошибках ────────────────────────────────────
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(CommandHandler("status",  on_status))
-    app.add_handler(CommandHandler("topicid", on_topicid))
-    app.add_handler(CommandHandler("help",    on_help))
-    app.add_handler(CommandHandler("start",   on_help))
-    log.info("🤖 ShipTrack Bot запущен")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    while True:
+        try:
+            app = Application.builder().token(BOT_TOKEN).build()
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+            app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+            app.add_handler(CommandHandler("status",  on_status))
+            app.add_handler(CommandHandler("topicid", on_topicid))
+            app.add_handler(CommandHandler("help",    on_help))
+            app.add_handler(CommandHandler("start",   on_help))
+            log.info("🤖 ShipTrack Bot запущен")
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True  # игнорируем накопившиеся сообщения при рестарте
+            )
+        except Exception as e:
+            log.error("❌ Бот упал с ошибкой: %s", e)
+            log.info("🔄 Перезапуск через 5 секунд...")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
