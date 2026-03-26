@@ -5,7 +5,7 @@ ShipTrack Telegram Bot
 Другие топики    → молчит
 Личка            → работает по подписи
 """
-import os, re, csv, logging, tempfile, threading, time
+import os, re, csv, logging, tempfile, threading, time, asyncio
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import openpyxl
@@ -508,23 +508,32 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Запуск с автоперезапуском при ошибках ────────────────────────────────────
+# ── Запуск с корректным перезапуском при ошибках ─────────────────────────────
+
+async def run_bot():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    app.add_handler(CommandHandler("status",  on_status))
+    app.add_handler(CommandHandler("topicid", on_topicid))
+    app.add_handler(CommandHandler("help",    on_help))
+    app.add_handler(CommandHandler("start",   on_help))
+    async with app:
+        await app.start()
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+        log.info("🤖 ShipTrack Bot запущен")
+        # Держим бота живым
+        while True:
+            await asyncio.sleep(1)
+
 
 def main():
     while True:
         try:
-            app = Application.builder().token(BOT_TOKEN).build()
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-            app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-            app.add_handler(CommandHandler("status",  on_status))
-            app.add_handler(CommandHandler("topicid", on_topicid))
-            app.add_handler(CommandHandler("help",    on_help))
-            app.add_handler(CommandHandler("start",   on_help))
-            log.info("🤖 ShipTrack Bot запущен")
-            app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
-            )
+            asyncio.run(run_bot())
         except Exception as e:
             log.error("❌ Бот упал с ошибкой: %s", e)
             log.info("🔄 Перезапуск через 5 секунд...")
