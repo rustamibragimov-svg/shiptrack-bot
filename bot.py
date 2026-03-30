@@ -77,6 +77,8 @@ threading.Thread(target=self_ping, daemon=True).start()
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Память о сигналах возврата: {chat_id: datetime}
+# Сигнал НЕ удаляется после первого файла — живёт 5 минут
+# Это позволяет обработать несколько PDF файлов подряд
 return_signals = {}
 RETURN_WINDOW  = 5 * 60  # 5 минут
 RETURN_WORDS   = {"возврат", "возвратов", "возврата", "возвраты"}
@@ -274,95 +276,63 @@ def parse_return_excel(path):
 
 
 def parse_return_pdf(path):
-    """Парсит PDF акта приёма-передачи — формат Uzum Market."""
+    """
+    Парсит PDF акта приёма-передачи Uzum Market.
+    Формат: №, Номер заказа, Кол-во (шт.), Стоимость (общая, рублей)
+    Заголовок "Стоимость" может быть разбит на две строки в PDF.
+    """
     items = []
     act_number = ""
 
     with pdfplumber.open(path) as pdf:
         full_text = ""
-        all_rows  = []
-
         for page in pdf.pages:
-            # Извлекаем текст для номера акта
             text = page.extract_text() or ""
-            full_text += text
+            full_text += text + "\n"
 
-            # Извлекаем таблицы
-            for table in page.extract_tables():
-                if table:
-                    all_rows.extend(table)
-
-        # Ищем номер акта в тексте
+        # Ищем номер акта
         m = re.search(r"Акт приема-передачи\s*№\s*(\d+)", full_text)
         if m:
             act_number = m.group(1)
 
-        # Если таблица не извлеклась — парсим текст построчно
-        if not all_rows:
-            for line in full_text.splitlines():
-                line = line.strip()
-                # Строка данных: начинается с числа (порядковый номер)
-                m = re.match(r"^(\d+)\s+([A-Z0-9]+UZ)\s+(\d+)\s+([\d\s]+)$", line)
-                if m:
-                    order = m.group(2)
-                    qty   = int(m.group(3))
-                    cost_str = m.group(4).replace(" ", "")
-                    try:
-                        cost = float(cost_str)
-                    except Exception:
-                        cost = 0.0
-                    items.append({"order_number": order, "quantity": qty, "cost": cost})
-            return items, act_number
+        # Парсим строки текста — самый надёжный способ для этого формата PDF
+        # Строка данных выглядит так: "1 RX122506485UZ 1 1504"
+        # или через несколько пробелов
+        ORDER_RE = re.compile(
+            r"^(\d+)\s+"           # порядковый номер
+            r"([A-Z]{2}\d+UZ)\s+"  # номер заказа
+            r"(\d+)\s+"            # кол-во
+            r"([\d\s]+)$"          # стоимость (может быть с пробелами)
+        )
 
-        # Обрабатываем строки таблицы
-        header_found = False
-        for row in all_rows:
-            if not row:
+        for line in full_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = ORDER_RE.match(line)
+            if m:
+                order    = m.group(2)
+                qty      = int(m.group(3))
+                cost_str = m.group(4).replace(" ", "")
+                try:
+                    cost = float(cost_str)
+                except Exception:
+                    cost = 0.0
+                items.append({"order_number": order, "quantity": qty, "cost": cost})
                 continue
 
-            # Очищаем ячейки
-            cells = [str(c or "").strip() for c in row]
-
-            # Ищем строку заголовка
-            row_text = " ".join(cells).lower()
-            if "номер заказа" in row_text or "номер" in row_text:
-                header_found = True
-                continue
-
-            if not header_found:
-                continue
-
-            # Проверяем что первая ячейка — порядковый номер
-            try:
-                int(cells[0])
-            except (ValueError, IndexError):
-                continue
-
-            # Ищем номер заказа (формат RX.../SX...UZ)
-            order = ""
-            qty   = 1
-            cost  = 0.0
-
-            for cell in cells:
-                if re.match(r"^[A-Z]{2}\d+UZ$", cell):
-                    order = cell
-                elif re.match(r"^\d+$", cell) and not order:
-                    pass  # порядковый номер, пропускаем
-                elif re.match(r"^\d+$", cell) and order and qty == 1:
-                    try:
-                        qty = int(cell)
-                    except Exception:
-                        pass
-                elif re.match(r"^[\d\s]+$", cell) and order:
-                    try:
-                        cost = float(cell.replace(" ", ""))
-                    except Exception:
-                        pass
-
-            if order and len(order) >= 5:
+            # Запасной вариант: ищем паттерн внутри строки
+            m2 = re.search(r"([A-Z]{2}\d+UZ)\s+(\d+)\s+([\d]+)", line)
+            if m2 and not any(i["order_number"] == m2.group(1) for i in items):
+                order = m2.group(1)
+                qty   = int(m2.group(2))
+                try:
+                    cost = float(m2.group(3))
+                except Exception:
+                    cost = 0.0
                 items.append({"order_number": order, "quantity": qty, "cost": cost})
 
-    log.info("📄 PDF распарсен: акт №%s, %d заказов", act_number, len(items))
+    log.info("📄 PDF: акт №%s, %d заказов", act_number, len(items))
     return items, act_number
 
 
@@ -446,7 +416,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id or 0
     is_group  = update.message.chat.type in ("group", "supergroup")
 
-    # Принимаем xlsx, xls, csv и pdf
     ext = os.path.splitext(fname)[1].lower()
     if ext not in (".xlsx", ".xls", ".csv", ".pdf"):
         return
@@ -455,7 +424,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if TOPIC_PRIEMKA and TOPIC_OTGRUZKA:
         if thread_id == TOPIC_PRIEMKA:
-            # Топик "Приёмка" → отгрузка (PDF здесь не нужен)
             ftype, project, date, date_label = detect(caption, chat_id)
             if ftype == "unknown":
                 await update.message.reply_text(
@@ -467,21 +435,17 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         elif thread_id == TOPIC_OTGRUZKA:
             # Топик "Отгрузка" → всегда возврат
+            # Сигнал НЕ удаляем — чтобы следующие файлы тоже обработались
             _, _, date, date_label = detect(caption, chat_id)
             ftype, project = "return", "ali"
-            if chat_id in return_signals:
-                del return_signals[chat_id]
         else:
             # Другой топик группы → молчим / Личка → по подписи
             if is_group:
                 return
             ftype, project, date, date_label = detect(caption, chat_id)
-            if ftype == "return" and chat_id in return_signals:
-                del return_signals[chat_id]
+            # В личке тоже НЕ удаляем сигнал — несколько файлов подряд
     else:
         ftype, project, date, date_label = detect(caption, chat_id)
-        if ftype == "return" and chat_id in return_signals:
-            del return_signals[chat_id]
 
     labels = {"shipment": "Отгрузка", "return": "Возврат", "unknown": "Файл"}
     msg = await update.message.reply_text(
@@ -496,7 +460,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await (await doc.get_file()).download_to_drive(path)
 
         if ftype == "return":
-            # Выбираем парсер по расширению
             if ext == ".pdf":
                 items, act_num = parse_return_pdf(path)
             else:
