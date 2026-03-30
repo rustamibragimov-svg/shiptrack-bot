@@ -77,8 +77,6 @@ threading.Thread(target=self_ping, daemon=True).start()
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Память о сигналах возврата: {chat_id: datetime}
-# Сигнал НЕ удаляется после первого файла — живёт 5 минут
-# Это позволяет обработать несколько PDF файлов подряд
 return_signals = {}
 RETURN_WINDOW  = 5 * 60  # 5 минут
 RETURN_WORDS   = {"возврат", "возвратов", "возврата", "возвраты"}
@@ -136,6 +134,14 @@ def detect(caption, chat_id):
         return "shipment", "mko", today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
     return "unknown", None, today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
+
+
+def act_already_exists(act_number: str) -> bool:
+    """Проверяет есть ли уже возврат с таким номером акта в базе."""
+    if not act_number:
+        return False
+    result = db.table("returns").select("id").eq("act_number", act_number).execute()
+    return len(result.data) > 0
 
 
 # ── Парсеры файлов ────────────────────────────────────────────────────────────
@@ -276,11 +282,7 @@ def parse_return_excel(path):
 
 
 def parse_return_pdf(path):
-    """
-    Парсит PDF акта приёма-передачи Uzum Market.
-    Формат: №, Номер заказа, Кол-во (шт.), Стоимость (общая, рублей)
-    Заголовок "Стоимость" может быть разбит на две строки в PDF.
-    """
+    """Парсит PDF акта приёма-передачи Uzum Market."""
     items = []
     act_number = ""
 
@@ -295,14 +297,11 @@ def parse_return_pdf(path):
         if m:
             act_number = m.group(1)
 
-        # Парсим строки текста — самый надёжный способ для этого формата PDF
-        # Строка данных выглядит так: "1 RX122506485UZ 1 1504"
-        # или через несколько пробелов
         ORDER_RE = re.compile(
-            r"^(\d+)\s+"           # порядковый номер
-            r"([A-Z]{2}\d+UZ)\s+"  # номер заказа
-            r"(\d+)\s+"            # кол-во
-            r"([\d\s]+)$"          # стоимость (может быть с пробелами)
+            r"^(\d+)\s+"
+            r"([A-Z]{2}\d+UZ)\s+"
+            r"(\d+)\s+"
+            r"([\d\s]+)$"
         )
 
         for line in full_text.splitlines():
@@ -321,7 +320,6 @@ def parse_return_pdf(path):
                 items.append({"order_number": order, "quantity": qty, "cost": cost})
                 continue
 
-            # Запасной вариант: ищем паттерн внутри строки
             m2 = re.search(r"([A-Z]{2}\d+UZ)\s+(\d+)\s+([\d]+)", line)
             if m2 and not any(i["order_number"] == m2.group(1) for i in items):
                 order = m2.group(1)
@@ -434,16 +432,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         elif thread_id == TOPIC_OTGRUZKA:
-            # Топик "Отгрузка" → всегда возврат
-            # Сигнал НЕ удаляем — чтобы следующие файлы тоже обработались
             _, _, date, date_label = detect(caption, chat_id)
             ftype, project = "return", "ali"
         else:
-            # Другой топик группы → молчим / Личка → по подписи
             if is_group:
                 return
             ftype, project, date, date_label = detect(caption, chat_id)
-            # В личке тоже НЕ удаляем сигнал — несколько файлов подряд
     else:
         ftype, project, date, date_label = detect(caption, chat_id)
 
@@ -468,6 +462,17 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not items:
                 await msg.edit_text("⚠️ Не нашёл данных о заказах в файле.")
                 return
+
+            # ── Проверка дублей по номеру акта ──
+            if act_num and act_already_exists(act_num):
+                log.info("⚠️ Акт №%s уже существует в базе — пропускаем", act_num)
+                await msg.edit_text(
+                    f"⚠️ *Акт №{act_num} уже добавлен в систему.*\n\n"
+                    f"Этот файл был пропущен чтобы избежать дублей.",
+                    parse_mode="Markdown"
+                )
+                return
+
             rid, name, total = save_return(items, act_num, fname, sender, date, date_label)
             await msg.edit_text(
                 f"🔄 *Возврат добавлен!*\n\n"
