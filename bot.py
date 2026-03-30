@@ -1,7 +1,7 @@
 """
 ShipTrack Telegram Bot
 Топик "Приёмка"  → отгрузки (АЛИ / МКО)
-Топик "Отгрузка" → возвраты
+Топик "Отгрузка" → возвраты (xlsx, xls, csv, pdf)
 Другие топики    → молчит
 Личка            → работает по подписи
 """
@@ -9,6 +9,7 @@ import os, re, csv, logging, tempfile, threading, time, asyncio
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import openpyxl
+import pdfplumber
 from supabase import create_client
 from telegram import Update
 from telegram.ext import (
@@ -35,7 +36,6 @@ log = logging.getLogger(__name__)
 
 
 # ── Health check сервер для Koyeb ─────────────────────────────────────────────
-# Запускаем НЕМЕДЛЕННО — до всего остального
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -62,7 +62,7 @@ def self_ping():
         log.warning("⚠️ PUBLIC_URL не задан — самопинг отключён")
         return
     while True:
-        time.sleep(4 * 60)  # каждые 4 минуты
+        time.sleep(4 * 60)
         try:
             urllib.request.urlopen(public_url, timeout=10)
             log.info("🏓 Self-ping OK")
@@ -273,6 +273,99 @@ def parse_return_excel(path):
     return items, act_number
 
 
+def parse_return_pdf(path):
+    """Парсит PDF акта приёма-передачи — формат Uzum Market."""
+    items = []
+    act_number = ""
+
+    with pdfplumber.open(path) as pdf:
+        full_text = ""
+        all_rows  = []
+
+        for page in pdf.pages:
+            # Извлекаем текст для номера акта
+            text = page.extract_text() or ""
+            full_text += text
+
+            # Извлекаем таблицы
+            for table in page.extract_tables():
+                if table:
+                    all_rows.extend(table)
+
+        # Ищем номер акта в тексте
+        m = re.search(r"Акт приема-передачи\s*№\s*(\d+)", full_text)
+        if m:
+            act_number = m.group(1)
+
+        # Если таблица не извлеклась — парсим текст построчно
+        if not all_rows:
+            for line in full_text.splitlines():
+                line = line.strip()
+                # Строка данных: начинается с числа (порядковый номер)
+                m = re.match(r"^(\d+)\s+([A-Z0-9]+UZ)\s+(\d+)\s+([\d\s]+)$", line)
+                if m:
+                    order = m.group(2)
+                    qty   = int(m.group(3))
+                    cost_str = m.group(4).replace(" ", "")
+                    try:
+                        cost = float(cost_str)
+                    except Exception:
+                        cost = 0.0
+                    items.append({"order_number": order, "quantity": qty, "cost": cost})
+            return items, act_number
+
+        # Обрабатываем строки таблицы
+        header_found = False
+        for row in all_rows:
+            if not row:
+                continue
+
+            # Очищаем ячейки
+            cells = [str(c or "").strip() for c in row]
+
+            # Ищем строку заголовка
+            row_text = " ".join(cells).lower()
+            if "номер заказа" in row_text or "номер" in row_text:
+                header_found = True
+                continue
+
+            if not header_found:
+                continue
+
+            # Проверяем что первая ячейка — порядковый номер
+            try:
+                int(cells[0])
+            except (ValueError, IndexError):
+                continue
+
+            # Ищем номер заказа (формат RX.../SX...UZ)
+            order = ""
+            qty   = 1
+            cost  = 0.0
+
+            for cell in cells:
+                if re.match(r"^[A-Z]{2}\d+UZ$", cell):
+                    order = cell
+                elif re.match(r"^\d+$", cell) and not order:
+                    pass  # порядковый номер, пропускаем
+                elif re.match(r"^\d+$", cell) and order and qty == 1:
+                    try:
+                        qty = int(cell)
+                    except Exception:
+                        pass
+                elif re.match(r"^[\d\s]+$", cell) and order:
+                    try:
+                        cost = float(cell.replace(" ", ""))
+                    except Exception:
+                        pass
+
+            if order and len(order) >= 5:
+                items.append({"order_number": order, "quantity": qty, "cost": cost})
+
+    log.info("📄 PDF распарсен: акт №%s, %d заказов", act_number, len(items))
+    return items, act_number
+
+
 # ── Сохранение в Supabase ─────────────────────────────────────────────────────
 
 def save_shipment(parcels, filename, sender, project, date, date_label):
@@ -353,13 +446,16 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id or 0
     is_group  = update.message.chat.type in ("group", "supergroup")
 
-    if not fname.lower().endswith((".xlsx", ".xls", ".csv")):
+    # Принимаем xlsx, xls, csv и pdf
+    ext = os.path.splitext(fname)[1].lower()
+    if ext not in (".xlsx", ".xls", ".csv", ".pdf"):
         return
 
     sender = update.message.from_user.full_name or "Unknown"
 
     if TOPIC_PRIEMKA and TOPIC_OTGRUZKA:
         if thread_id == TOPIC_PRIEMKA:
+            # Топик "Приёмка" → отгрузка (PDF здесь не нужен)
             ftype, project, date, date_label = detect(caption, chat_id)
             if ftype == "unknown":
                 await update.message.reply_text(
@@ -370,6 +466,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         elif thread_id == TOPIC_OTGRUZKA:
+            # Топик "Отгрузка" → всегда возврат
             _, _, date, date_label = detect(caption, chat_id)
             ftype, project = "return", "ali"
             if chat_id in return_signals:
@@ -392,7 +489,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    ext = os.path.splitext(fname)[1].lower()
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         path = tmp.name
 
@@ -400,7 +496,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await (await doc.get_file()).download_to_drive(path)
 
         if ftype == "return":
-            items, act_num = parse_return_excel(path)
+            # Выбираем парсер по расширению
+            if ext == ".pdf":
+                items, act_num = parse_return_pdf(path)
+            else:
+                items, act_num = parse_return_excel(path)
+
             if not items:
                 await msg.edit_text("⚠️ Не нашёл данных о заказах в файле.")
                 return
@@ -515,8 +616,8 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛒 `АЛИ 25.03` — отгрузка AliExpress\n"
         "📦 `МКО` — отгрузка Uzum Crossborder\n\n"
         "В топике *Отгрузка* отправьте файл возврата — "
-        "бот определит его автоматически.\n\n"
-        "Форматы: .xlsx, .xls, .csv\n\n"
+        "бот определит его автоматически.\n"
+        "Форматы: .xlsx, .xls, .csv, .pdf\n\n"
         "/status — статистика\n"
         "/topicid — ID текущего топика\n"
         "/help — эта справка",
