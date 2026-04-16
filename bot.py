@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 
 # ══════════════════════════════════════════════════════════════
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ — задаются в Koyeb → Environment
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ — задаются в Render → Environment
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -35,7 +35,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Health check сервер для Koyeb ─────────────────────────────────────────────
+# ── Health check сервер для Render ────────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -53,7 +53,7 @@ threading.Thread(target=_health_server.serve_forever, daemon=True).start()
 log.info("✅ Health server запущен на порту %s", _health_port)
 
 
-# ── Самопинг — не даёт Koyeb усыпить сервис ──────────────────────────────────
+# ── Самопинг — не даёт Render усыпить сервис ─────────────────────────────────
 
 def self_ping():
     import urllib.request
@@ -144,45 +144,10 @@ def act_already_exists(act_number: str) -> bool:
     return len(result.data) > 0
 
 
-# ── Парсеры файлов ────────────────────────────────────────────────────────────
-
-def parse_shipment_excel(path):
-    wb = openpyxl.load_workbook(path, data_only=True)
-    parcels = []
-    for ws in wb.worksheets:
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
-            continue
-        header = [str(c or "").lower() for c in rows[0]]
-        bi = next((i for i, h in enumerate(header) if "штрихкод" in h or "barcode" in h), len(header) - 1)
-        ni = next((i for i, h in enumerate(header) if "имя" in h or "name" in h or "фио" in h), -1)
-        pi = next((i for i, h in enumerate(header) if "телефон" in h or "phone" in h), -1)
-        ai = next((i for i, h in enumerate(header) if "адрес" in h or "address" in h), -1)
-        wi = next((i for i, h in enumerate(header) if "вес" in h or "weight" in h), -1)
-
-        def g(row, i):
-            return str(row[i] or "").strip() if 0 <= i < len(row) else ""
-
-        for row in rows[1:]:
-            barcode = g(row, bi)
-            if barcode and len(barcode) >= 5:
-                w = 0
-                if wi >= 0:
-                    try:
-                        w = int(float(str(row[wi] or 0)))
-                    except Exception:
-                        pass
-                parcels.append({
-                    "barcode":        barcode,
-                    "recipient_name": g(row, ni),
-                    "phone":          g(row, pi),
-                    "address":        g(row, ai),
-                    "weight":         w,
-                })
-    return parcels
-
+# ── Парсеры отгрузок ──────────────────────────────────────────────────────────
 
 def parse_shipment_csv(path):
+    """CSV файл отгрузки — колонка Штрихкод."""
     parcels = []
     for enc in ["utf-8-sig", "utf-8", "cp1251"]:
         try:
@@ -227,7 +192,86 @@ def parse_shipment_csv(path):
     return parcels
 
 
+def parse_shipment_excel(path):
+    """Excel файл отгрузки — колонка Штрихкод."""
+    wb = openpyxl.load_workbook(path, data_only=True)
+    parcels = []
+    for ws in wb.worksheets:
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+        header = [str(c or "").lower() for c in rows[0]]
+        bi = next((i for i, h in enumerate(header) if "штрихкод" in h or "barcode" in h), len(header) - 1)
+        ni = next((i for i, h in enumerate(header) if "имя" in h or "name" in h or "фио" in h), -1)
+        pi = next((i for i, h in enumerate(header) if "телефон" in h or "phone" in h), -1)
+        ai = next((i for i, h in enumerate(header) if "адрес" in h or "address" in h), -1)
+        wi = next((i for i, h in enumerate(header) if "вес" in h or "weight" in h), -1)
+
+        def g(row, i):
+            return str(row[i] or "").strip() if 0 <= i < len(row) else ""
+
+        for row in rows[1:]:
+            barcode = g(row, bi)
+            if barcode and len(barcode) >= 5:
+                w = 0
+                if wi >= 0:
+                    try:
+                        w = int(float(str(row[wi] or 0)))
+                    except Exception:
+                        pass
+                parcels.append({
+                    "barcode":        barcode,
+                    "recipient_name": g(row, ni),
+                    "phone":          g(row, pi),
+                    "address":        g(row, ai),
+                    "weight":         w,
+                })
+    return parcels
+
+
+# ── Парсеры возвратов ─────────────────────────────────────────────────────────
+
+def parse_return_csv(path):
+    """CSV файл возврата — колонки: Номер заказа, Кол-во, Стоимость."""
+    items = []
+    act_number = ""
+    for enc in ["utf-8-sig", "utf-8", "cp1251"]:
+        try:
+            with open(path, "r", encoding=enc) as f:
+                s = f.read(2048)
+                f.seek(0)
+                delim = ";" if s.count(";") > s.count(",") else ","
+                for row in csv.DictReader(f, delimiter=delim):
+                    order = ""
+                    qty   = 1
+                    cost  = 0.0
+                    for k, v in row.items():
+                        if not k:
+                            continue
+                        kl = k.lower()
+                        if "номер" in kl or "order" in kl:
+                            order = str(v or "").strip()
+                        elif "кол" in kl or "шт" in kl or "qty" in kl:
+                            try:
+                                qty = int(v or 1)
+                            except Exception:
+                                pass
+                        elif "стоимость" in kl or "сумм" in kl or "cost" in kl:
+                            try:
+                                cost = float(str(v or 0).replace(" ", ""))
+                            except Exception:
+                                pass
+                    if order and len(order) >= 5:
+                        items.append({"order_number": order, "quantity": qty, "cost": cost})
+            if items:
+                return items, act_number
+        except Exception:
+            continue
+    return items, act_number
+
+
 def parse_return_excel(path):
+    """Excel файл возврата — Акт приема-передачи."""
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
@@ -282,26 +326,21 @@ def parse_return_excel(path):
 
 
 def parse_return_pdf(path):
-    """Парсит PDF акта приёма-передачи Uzum Market."""
+    """PDF файл возврата — Акт приема-передачи Uzum Market."""
     items = []
     act_number = ""
 
     with pdfplumber.open(path) as pdf:
         full_text = ""
         for page in pdf.pages:
-            text = page.extract_text() or ""
-            full_text += text + "\n"
+            full_text += (page.extract_text() or "") + "\n"
 
-        # Ищем номер акта
         m = re.search(r"Акт приема-передачи\s*№\s*(\d+)", full_text)
         if m:
             act_number = m.group(1)
 
         ORDER_RE = re.compile(
-            r"^(\d+)\s+"
-            r"([A-Z]{2}\d+UZ)\s+"
-            r"(\d+)\s+"
-            r"([\d\s]+)$"
+            r"^(\d+)\s+([A-Z]{2}\d+UZ)\s+(\d+)\s+([\d\s]+)$"
         )
 
         for line in full_text.splitlines():
@@ -426,7 +465,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ftype == "unknown":
                 await update.message.reply_text(
                     "❓ Добавьте подпись к файлу:\n"
-                    "• `АЛИ 25.03` — AliExpress\n"
+                    "• `АЛИ 15.04` — AliExpress\n"
                     "• `МКО` — Uzum Crossborder",
                     parse_mode="Markdown"
                 )
@@ -453,9 +492,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await (await doc.get_file()).download_to_drive(path)
 
+        # ── Возврат ──
         if ftype == "return":
             if ext == ".pdf":
                 items, act_num = parse_return_pdf(path)
+            elif ext == ".csv":
+                items, act_num = parse_return_csv(path)
             else:
                 items, act_num = parse_return_excel(path)
 
@@ -463,12 +505,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text("⚠️ Не нашёл данных о заказах в файле.")
                 return
 
-            # ── Проверка дублей по номеру акта ──
+            # Проверка дублей по номеру акта
             if act_num and act_already_exists(act_num):
-                log.info("⚠️ Акт №%s уже существует в базе — пропускаем", act_num)
+                log.info("⚠️ Акт №%s уже существует — пропускаем", act_num)
                 await msg.edit_text(
                     f"⚠️ *Акт №{act_num} уже добавлен в систему.*\n\n"
-                    f"Этот файл был пропущен чтобы избежать дублей.",
+                    f"Файл пропущен чтобы избежать дублей.",
                     parse_mode="Markdown"
                 )
                 return
@@ -483,12 +525,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
+        # ── Отгрузка ──
         elif ftype == "shipment":
-            parcels = (
-                parse_shipment_csv(path)
-                if ext == ".csv"
-                else parse_shipment_excel(path)
-            )
+            if ext == ".csv":
+                parcels = parse_shipment_csv(path)
+            else:
+                parcels = parse_shipment_excel(path)
+
             if not parcels:
                 await msg.edit_text(
                     "⚠️ Не нашёл штрихкодов. Нужна колонка *Штрихкод*.",
@@ -509,13 +552,14 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
+        # ── Неизвестный тип ──
         else:
             await msg.edit_text(
                 "❓ Не могу определить тип файла.\n\n"
                 "Добавьте подпись к файлу:\n"
-                "• `АЛИ 25.03` — отгрузка AliExpress\n"
+                "• `АЛИ 15.04` — отгрузка AliExpress\n"
                 "• `МКО` — отгрузка Uzum\n"
-                "• `ВОЗВРАТ 17.03` — возврат\n\n"
+                "• `ВОЗВРАТ 15.04` — возврат\n\n"
                 "Или напишите сообщение со словом «возвратов» перед файлом.",
                 parse_mode="Markdown"
             )
@@ -534,7 +578,7 @@ async def on_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📌 *Информация о топике*\n\n"
         f"Chat ID: `{chat_id}`\n"
         f"Topic ID: `{thread_id}`\n\n"
-        f"Добавьте в Koyeb → Environment variables:\n\n"
+        f"Добавьте в Render → Environment variables:\n\n"
         f"Если это топик *Приёмка* (отгрузки):\n"
         f"`TOPIC_PRIEMKA` = `{thread_id}`\n\n"
         f"Если это топик *Отгрузка* (возвраты):\n"
@@ -581,7 +625,7 @@ async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *ShipTrack — Инструкция*\n\n"
         "В топике *Приёмка* отправьте файл с подписью:\n"
-        "🛒 `АЛИ 25.03` — отгрузка AliExpress\n"
+        "🛒 `АЛИ 15.04` — отгрузка AliExpress\n"
         "📦 `МКО` — отгрузка Uzum Crossborder\n\n"
         "В топике *Отгрузка* отправьте файл возврата — "
         "бот определит его автоматически.\n"
