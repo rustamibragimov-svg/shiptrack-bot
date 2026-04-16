@@ -131,7 +131,8 @@ def detect(caption, chat_id):
         return "shipment", "ali", di, dl
 
     if "МКО" in up or "MKO" in up:
-        return "shipment", "mko", today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
+        di, dl = parse_date(up)
+        return "shipment", "mko", di, dl
 
     return "unknown", None, today.strftime("%Y-%m-%d"), today.strftime("%d.%m")
 
